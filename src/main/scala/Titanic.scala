@@ -1,99 +1,99 @@
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.Pipeline
 
 object Titanic extends App {
-  // Initialize SparkSession
+
+  // Initialize Spark session
   val spark = SparkSession.builder()
-    .appName("Titanic Data Analysis")
-    .config("spark.master", "local")
+    .appName("Titanic Survival Prediction")
+    .master("local[*]")
     .getOrCreate()
 
-  import spark.implicits._
-
-  // Load the Titanic dataset
-  val df = spark.read
+  // Load the dataset
+  val trainDF = spark.read
     .option("header", "true")
     .option("inferSchema", "true")
     .csv("train.csv")
 
-  // 1) Average Ticket Fare for Each Ticket Class
-  val averageFareByClass = df.groupBy("Pclass")
-    .agg(avg("Fare").alias("Average_Fare"))
-    .orderBy("Pclass")
+  // Fill missing values
+  val ageMedian = trainDF.stat.approxQuantile("Age", Array(0.5), 0.001).head
+  val fareMedian = trainDF.stat.approxQuantile("Fare", Array(0.5), 0.001).head
+  val embarkedMode = trainDF.groupBy("Embarked").count().orderBy(desc("count")).first().getString(0)
 
-  // 2) Survival Percentage for Each Ticket Class
-  val survivalRateByClass = df.groupBy("Pclass")
-    .agg((sum("Survived") / count("Survived") * 100).alias("Survival_Rate"))
-    .orderBy(desc("Survival_Rate"))
+  val filledDF = trainDF.na.fill(Map(
+    "Age" -> ageMedian,
+    "Fare" -> fareMedian,
+    "Embarked" -> embarkedMode
+  ))
 
-  // 3) Find Passengers Possibly be Rose
-  val possibleRoses = df.filter(
-      col("Pclass") === 1 &&
-      col("Sex") === "female" &&
-      col("Age") === 17.0 &&
-        col("Parch") === 1
-  )
+  // Feature engineering
+  val featureEngDF = filledDF
+    .withColumn("FamilySize", col("SibSp") + col("Parch"))
+    .withColumn("IsAlone", when(col("FamilySize") === 0, 1).otherwise(0))
+    .withColumn("Sex", when(col("Sex") === "male", 0).otherwise(1))
+    .withColumn("Embarked", when(col("Embarked") === "Q", 0).when(col("Embarked") === "S", 1).otherwise(2))
+    .drop("PassengerId", "Name", "Ticket", "Cabin", "SibSp", "Parch")
 
-  // Counting the number of possible Roses
-  val numberOfPossibleRoses = possibleRoses.count()
+  // Split the data
+  val Array(trainingData, testData) = featureEngDF.randomSplit(Array(0.8, 0.2))
 
-  // 4) Find Passengers Possibly be Jack
-  val possibleJacks = df.filter(
-      col("Pclass") === 3 &&
-      col("Sex") === "male" &&
-      col("Age").isin(17.0, 18.0) &&
-      col("Parch") === 0 &&
-        col("SibSp") === 0
-  )
+  // Configure an ML pipeline
+  val assembler = new VectorAssembler()
+    .setInputCols(Array("Pclass", "Sex", "Age", "Fare", "Embarked", "FamilySize", "IsAlone"))
+    .setOutputCol("features")
 
-  // Counting the number of possible Roses
-  val numberOfPossibleJacks = possibleJacks.count()
+  val logisticRegression = new LogisticRegression()
+    .setLabelCol("Survived")
+    .setFeaturesCol("features")
 
-  // 5) Relation between Ages and Ticket Fare, Most Possibly Survived Group
-  val ageGroup = when($"Age" <= 10, "1-10")
-    .when($"Age" > 10 && $"Age" <= 20, "11-20")
-    .when($"Age" > 20 && $"Age" <= 30, "21-30")
-    .when($"Age" > 30 && $"Age" <= 40, "31-40")
-    .when($"Age" > 40 && $"Age" <= 50, "41-50")
-    .when($"Age" > 50 && $"Age" <= 60, "51-60")
-    .when($"Age" > 60, "61+")
-    .otherwise("Unknown")
+  val pipeline = new Pipeline().setStages(Array(assembler, logisticRegression))
 
-  val dfWithAgeGroup = df.withColumn("Age_Group", ageGroup)
+  // Train the model
+  val model = pipeline.fit(trainingData)
 
-  val fareByAgeGroup = dfWithAgeGroup.groupBy("Age_Group")
-    .agg(avg("Fare").alias("Average_Fare"))
-    .orderBy("Age_Group")
+  // Make predictions
+  val predictions = model.transform(testData)
 
-  val survivalByAgeGroup = dfWithAgeGroup.groupBy("Age_Group")
-    .agg((sum("Survived") / count("Survived") * 100).alias("Survival_Rate"))
-    .orderBy("Age_Group")
+  // Select example rows to display
+  predictions.select("prediction", "Survived", "features").show(5)
 
-  // Show Results
-  // 1) The average fare of 1st class is about 84.15, the 2nd class is about 20.66, the 3rd class is about 13.68
-  println("Average Ticket Fare for Each Ticket Class:")
-  averageFareByClass.show()
+  // Evaluate the model
+  val evaluator = new MulticlassClassificationEvaluator()
+    .setLabelCol("Survived")
+    .setPredictionCol("prediction")
+    .setMetricName("accuracy")
 
-  // 2) The survival percentage of 1st class is about 62.96%, the 2nd class is about 47.28%, the 3rd class is about 24.24%
-  // The 1st class has the highest survival rate
-  println("Survival Percentage for Each Ticket Class:")
-  survivalRateByClass.show()
+  val accuracy = evaluator.evaluate(predictions)
+  println(s"Accuracy: $accuracy")
 
-  // 3) The number of possible Roses is 0
-  println(s"Number of possible Roses: $numberOfPossibleRoses")
+  // Load the new passenger data
+  val passengersDF = spark.read
+    .option("header", "true")
+    .option("inferSchema", "true")
+    .csv("test.csv")
 
-  // 4) The number of possible Jacks is 9
-  println(s"Number of possible Jacks: $numberOfPossibleJacks")
+  // Feature engineering on the new passenger data
+  val featurePassengerDF = passengersDF
+    .na.fill(Map(
+      "Age" -> ageMedian,
+      "Fare" -> fareMedian,
+      "Embarked" -> embarkedMode
+    ))
+    .withColumn("FamilySize", col("SibSp") + col("Parch"))
+    .withColumn("IsAlone", when(col("FamilySize") === 0, 1).otherwise(0))
+    .withColumn("Sex", when(col("Sex") === "male", 0).otherwise(1))
+    .withColumn("Embarked", when(col("Embarked") === "Q", 0).when(col("Embarked") === "S", 1).otherwise(2))
 
-  // 5) For Ages between 1-30, younger passengers have higher fare in average
-  // For Ages between 31-60, older passengers have higher fare in average
-  println("Relation Between Ages and Ticket Fare:")
-  fareByAgeGroup.show()
+  // Predict survival on the new data
+  val predictionsForPassengers = model.transform(featurePassengerDF)
 
-  // The age group '1-10' most likely survived, whose survival rate is 59.375%
-  println("Survival Rate by Age Group:")
-  survivalByAgeGroup.show()
+  // Show predictions along with PassengerId
+  predictionsForPassengers.select("PassengerId", "name", "prediction").show()
+
+  // Stop the Spark session
+  spark.stop()
 }
-
-
-
